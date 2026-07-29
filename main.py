@@ -5,10 +5,30 @@ import json
 from groq import Groq
 
 app = FastAPI()
+REVIEW_COLUMN_ALIASES = (
+    "Review",
+    "review",
+    "review_text",
+    "tweet_text",
+    "full_text",
+    "text",
+    "content",
+    "comment",
+    "message",
+)
+
+
+def find_review_column(columns):
+    lookup = {str(column).strip().lower(): column for column in columns}
+    for alias in REVIEW_COLUMN_ALIASES:
+        column = lookup.get(alias.lower())
+        if column is not None:
+            return column
+    return None
 
 @app.get("/")
 def read_root():
-    return {"How to use": "API takes in a CSV or EXCEL file containing reviews with a column named 'Review' and returns the average POSITIVE, NEGATIVE and NEUTRAL sentiment score of the reviews."}
+    return {"How to use": "Upload a CSV or Excel file containing reviews. Supported text columns include Review, review_text, tweet_text, full_text, text, content, comment, and message."}
 
 @app.post("/read_reviews")
 def read_reviews(file: UploadFile):
@@ -25,22 +45,38 @@ def read_reviews(file: UploadFile):
         HTTPException: If the file format is incorrect or if the column 'Review' is not found in the file.
     """
     # Check if the file is in the correct format
-    if file.filename.endswith(".xlsx"):
+    filename = file.filename or ""
+    if filename.endswith(".xlsx"):
         df = pd.read_excel(file.file)
-    elif file.filename.endswith(".csv"):
+    elif filename.endswith(".csv"):
         df = pd.read_csv(file.file)
     else:
         raise HTTPException(status_code=400, detail="Incorrect format of input file")
     
     try:
         # Extract the reviews from the file
-        reviews = list(df["Review"])
+        review_column = find_review_column(df.columns)
+        if review_column is None:
+            supported = ", ".join(REVIEW_COLUMN_ALIASES)
+            raise HTTPException(status_code=400, detail=f"No supported review column found. Use one of: {supported}")
+        reviews = [
+            str(item).strip()
+            for item in df[review_column].dropna().tolist()
+            if str(item).strip()
+        ]
+        if not reviews:
+            raise HTTPException(status_code=400, detail="No non-empty reviews found")
         # Format the reviews in a JSON compatible format
         formatted_reviews = ', '.join(f"{index}: '{item}'" for index, item in enumerate(reviews))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="No column 'Review' found")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Review column could not be read")
     
     # Create a Groq client with the API key
+    if not os.environ.get("GROQ_API_KEY"):
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+
     client = Groq(
         api_key=os.environ.get("GROQ_API_KEY")
     )
@@ -62,8 +98,8 @@ def read_reviews(file: UploadFile):
     
     try:
         # Parse the sentiment analysis response from JSON
-        str = chat_completion.choices[0].message.content
-        review  = json.loads(str)
+        response_text = chat_completion.choices[0].message.content
+        review  = json.loads(response_text)
         
         # Compute the average sentiment scores for each review
         total = len(review)
@@ -86,7 +122,6 @@ def read_reviews(file: UploadFile):
         }
         
         return {"data": analysis}
-    except Exception as e:
-        print(e)
+    except Exception:
         raise HTTPException(status_code=400, detail="Reupload file")
     
